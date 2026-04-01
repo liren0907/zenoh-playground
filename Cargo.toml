@@ -1,0 +1,10 @@
+[package]
+name = "zenoh-playground"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+rand = "0.9"
+tokio = { version = "1.50.0", features = ["full"] }
+zenoh = { version = "1.8.0", features = ["shared-memory", "unstable"] }
