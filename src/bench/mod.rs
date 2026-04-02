@@ -116,3 +116,35 @@ pub fn print_report(result: &BenchResult) {
     println!("  {:>10.2} MB/s", result.throughput_mb_per_sec);
     println!("========================");
 }
+
+/// 將多個結果印出為比較表格（依 p50 延遲排序）
+pub fn print_comparison(results: &[BenchResult]) {
+    if results.is_empty() {
+        return;
+    }
+
+    let mut sorted: Vec<&BenchResult> = results.iter().collect();
+    sorted.sort_by(|a, b| a.p50_us.partial_cmp(&b.p50_us).unwrap());
+
+    let payload_desc = if sorted.iter().all(|r| r.payload_size == sorted[0].payload_size) {
+        format!("{} bytes", sorted[0].payload_size)
+    } else {
+        "mixed".to_string()
+    };
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                    Benchmark Comparison (payload: {:>10})                ║", payload_desc);
+    println!("╠════════════════╦══════════╦══════════╦══════════╦══════════╦═════════════════╣");
+    println!("║ Protocol       ║  p50(us) ║  p95(us) ║  p99(us) ║ mean(us) ║     msg/s       ║");
+    println!("╠════════════════╬══════════╬══════════╬══════════╬══════════╬═════════════════╣");
+
+    for r in &sorted {
+        println!(
+            "║ {:<14} ║ {:>8.1} ║ {:>8.1} ║ {:>8.1} ║ {:>8.1} ║ {:>13.1}   ║",
+            r.protocol, r.p50_us, r.p95_us, r.p99_us, r.mean_us, r.throughput_msg_per_sec
+        );
+    }
+
+    println!("╚════════════════╩══════════╩══════════╩══════════╩══════════╩═════════════════╝");
+}

@@ -5,13 +5,21 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+prost = "0.14"
 rand = "0.9"
 rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.50.0", features = ["full"] }
+tonic = "0.14"
+tonic-prost = "0.14"
 zenoh = { version = "1.8.0", features = ["shared-memory", "unstable"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [[bin]]
 name = "bench-server"
@@ -20,3 +28,7 @@ path = "src/bin/bench_server.rs"
 [[bin]]
 name = "bench-client"
 path = "src/bin/bench_client.rs"
+
+[[bin]]
+name = "bench-all"
+path = "src/bin/bench_all.rs"

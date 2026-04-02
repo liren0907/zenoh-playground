@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package bench;
+
+service Echo {
+  rpc SendBytes(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  bytes data = 1;
+}
+
+message EchoResponse {
+  bytes data = 1;
+}
