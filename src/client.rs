@@ -15,7 +15,7 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
         let mut counter = 0;
         loop {
             counter += 1;
-            println!("[Client] 發送查詢 #{}", counter);
+            println!("[Client] Sending query #{}", counter);
 
             // 查詢 echo 服務
             match session
@@ -27,14 +27,14 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
                     while let Ok(reply) = replies.recv_async().await {
                         if let Ok(sample) = reply.result() {
                             println!(
-                                "[Client] Echo 回覆: {}",
+                                "[Client] Echo reply: {}",
                                 sample.payload().try_to_string().unwrap_or_default()
                             );
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Client] Echo 查詢失敗: {}", e);
+                    eprintln!("[Client] Echo query failed: {}", e);
                 }
             }
 
@@ -49,14 +49,14 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
                     while let Ok(reply) = replies.recv_async().await {
                         if let Ok(sample) = reply.result() {
                             println!(
-                                "[Client] Convert 回覆: {}",
+                                "[Client] Convert reply: {}",
                                 sample.payload().try_to_string().unwrap_or_default()
                             );
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Client] Convert 查詢失敗: {}", e);
+                    eprintln!("[Client] Convert query failed: {}", e);
                 }
             }
 

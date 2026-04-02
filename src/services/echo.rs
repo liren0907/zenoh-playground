@@ -8,7 +8,7 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
     let queryable = session
         .declare_queryable("service/echo")
         .await
-        .map_err(|e| anyhow::anyhow!("無法宣告 Echo 查詢服務: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to declare Echo queryable: {}", e))?;
 
     let handle = tokio::spawn(async move {
         // 持續監聽傳入的查詢
@@ -18,14 +18,14 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
                 .payload()
                 .map(|p| p.try_to_string().unwrap_or_default().to_string())
                 .unwrap_or_default();
-            println!("[Echo 服務] 收到: {}", msg);
+            println!("[Echo Service] Received: {}", msg);
 
             // 回應查詢，回傳 echo 後的訊息
             if let Err(e) = query
                 .reply(query.key_expr().clone(), format!("Echo: {}", msg))
                 .await
             {
-                eprintln!("[Echo 服務] 回覆失敗: {}", e);
+                eprintln!("[Echo Service] Reply failed: {}", e);
             }
         }
     });

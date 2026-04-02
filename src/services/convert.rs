@@ -8,7 +8,7 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
     let queryable = session
         .declare_queryable("service/convert")
         .await
-        .map_err(|e| anyhow::anyhow!("無法宣告 Convert 查詢服務: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to declare Convert queryable: {}", e))?;
 
     let handle = tokio::spawn(async move {
         // 持續監聽傳入的查詢
@@ -18,17 +18,17 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
                 .payload()
                 .map(|p| p.try_to_string().unwrap_or_default().to_string())
                 .unwrap_or_default();
-            println!("[Binary Convert 服務] 收到: {}", msg);
+            println!("[Binary Convert Service] Received: {}", msg);
 
             // 嘗試解析訊息為整數，並轉換為二進位
             let reply = msg
                 .parse::<i64>()
-                .map(|v| format!("{} 的二進位格式為 0b{:b}", v, v))
-                .unwrap_or_else(|_| "錯誤：不是有效的整數".into());
+                .map(|v| format!("{} in binary is 0b{:b}", v, v))
+                .unwrap_or_else(|_| "Error: not a valid integer".into());
 
             // 回應查詢，傳回二進位轉換結果
             if let Err(e) = query.reply(query.key_expr().clone(), reply).await {
-                eprintln!("[Binary Convert 服務] 回覆失敗: {}", e);
+                eprintln!("[Binary Convert Service] Reply failed: {}", e);
             }
         }
     });

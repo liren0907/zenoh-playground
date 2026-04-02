@@ -20,8 +20,8 @@ async fn main() -> Result<()> {
     let session = zenoh::open(config)
         .await
         .map_err(|e| anyhow::anyhow!(e))
-        .context("無法初始化 Zenoh session")?;
-    println!("Zenoh 多服務節點啟動！（已啟用共享記憶體）");
+        .context("Failed to initialize Zenoh session")?;
+    println!("Zenoh multi-service node started! (shared memory enabled)");
 
     // 啟動所有服務，取得各任務的 handle
     let echo_handle = services::echo::spawn(&session).await?;
@@ -31,11 +31,11 @@ async fn main() -> Result<()> {
     let client_handle = client::spawn(&session).await?;
 
     // 等待 Ctrl+C 訊號以優雅地關閉
-    println!("按下 Ctrl+C 以關閉...");
+    println!("Press Ctrl+C to shutdown...");
     tokio::signal::ctrl_c()
         .await
-        .context("無法監聽 Ctrl+C 訊號")?;
-    println!("\n正在關閉 Zenoh session...");
+        .context("Failed to listen for Ctrl+C signal")?;
+    println!("\nShutting down Zenoh session...");
 
     // 中止所有任務
     echo_handle.abort();
@@ -49,8 +49,8 @@ async fn main() -> Result<()> {
         .close()
         .await
         .map_err(|e| anyhow::anyhow!(e))
-        .context("關閉 session 失敗")?;
-    println!("Zenoh session 已關閉。");
+        .context("Failed to close session")?;
+    println!("Zenoh session closed.");
 
     Ok(())
 }

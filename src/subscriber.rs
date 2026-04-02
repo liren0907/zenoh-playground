@@ -8,7 +8,7 @@ pub async fn spawn(session: &Session) -> Result<JoinHandle<()>> {
     let subscriber = session
         .declare_subscriber("sensor/**")
         .await
-        .map_err(|e| anyhow::anyhow!("無法宣告訂閱者: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to declare subscriber: {}", e))?;
 
     let handle = tokio::spawn(async move {
         // 持續監聽感測器主題的發佈資料
