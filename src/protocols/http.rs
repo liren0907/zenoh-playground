@@ -146,10 +146,34 @@ impl HttpStreamClient {
         anyhow::bail!("HTTP server not reachable after 20 attempts")
     }
 
-    pub async fn subscribe(&self, count: usize) -> Result<usize> {
+    pub async fn subscribe(&self, count: usize, payload_size: usize, publishers: usize) -> Result<usize> {
+        if publishers <= 1 {
+            Self::subscribe_single_stream(count, payload_size).await
+        } else {
+            // 多串流併發：每個 stream 接收 count/publishers 條訊息
+            let base_count = count / publishers;
+            let remainder = count % publishers;
+
+            let mut handles = Vec::with_capacity(publishers);
+            for i in 0..publishers {
+                let stream_count = base_count + if i < remainder { 1 } else { 0 };
+                handles.push(tokio::spawn(
+                    Self::subscribe_single_stream(stream_count, payload_size),
+                ));
+            }
+
+            let mut total = 0;
+            for handle in handles {
+                total += handle.await??;
+            }
+            Ok(total)
+        }
+    }
+
+    async fn subscribe_single_stream(count: usize, payload_size: usize) -> Result<usize> {
         use futures::StreamExt;
 
-        let url = format!("{}?payload_size=1024&count={}", HTTP_STREAM_URL, count);
+        let url = format!("{}?payload_size={}&count={}", HTTP_STREAM_URL, payload_size, count);
         let resp = reqwest::get(&url).await?;
         let mut stream = resp.bytes_stream();
 

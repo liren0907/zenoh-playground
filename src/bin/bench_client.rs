@@ -30,6 +30,18 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     warmup: usize,
 
+    /// Number of concurrent publishers (pub/sub mode, for display)
+    #[arg(long, default_value_t = 1)]
+    publishers: usize,
+
+    /// Duration in seconds for sustained load mode (overrides --iterations)
+    #[arg(long)]
+    duration: Option<u64>,
+
+    /// Window size in seconds for sustained load reporting
+    #[arg(long, default_value_t = 5)]
+    window: u64,
+
     /// Write JSON results to this file
     #[arg(long)]
     json_output: Option<String>,
@@ -65,21 +77,45 @@ async fn main() -> Result<()> {
         }
         BenchMode::PubSub => {
             let subscriber = protocols::create_subscriber(&args.protocol).await?;
-            let result = bench::run_pubsub_benchmark(
-                &subscriber,
-                &args.protocol.to_string(),
-                args.payload_size,
-                args.iterations,
-                args.warmup,
-            )
-            .await?;
 
-            bench::print_pubsub_report(&result);
+            if let Some(duration) = args.duration {
+                // Sustained load 模式
+                let result = bench::run_sustained_benchmark(
+                    &subscriber,
+                    &args.protocol.to_string(),
+                    args.payload_size,
+                    duration,
+                    args.window,
+                    args.publishers,
+                )
+                .await?;
 
-            if let Some(path) = &args.json_output {
-                let json = serde_json::to_string_pretty(&result)?;
-                std::fs::write(path, &json)?;
-                println!("Results written to {}", path);
+                bench::print_sustained_report(&result);
+
+                if let Some(path) = &args.json_output {
+                    let json = serde_json::to_string_pretty(&result)?;
+                    std::fs::write(path, &json)?;
+                    println!("Results written to {}", path);
+                }
+            } else {
+                // 一般 count-based 模式
+                let result = bench::run_pubsub_benchmark(
+                    &subscriber,
+                    &args.protocol.to_string(),
+                    args.payload_size,
+                    args.iterations,
+                    args.warmup,
+                    args.publishers,
+                )
+                .await?;
+
+                bench::print_pubsub_report(&result);
+
+                if let Some(path) = &args.json_output {
+                    let json = serde_json::to_string_pretty(&result)?;
+                    std::fs::write(path, &json)?;
+                    println!("Results written to {}", path);
+                }
             }
         }
     }

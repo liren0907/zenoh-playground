@@ -24,6 +24,14 @@ struct Args {
     /// Number of messages to publish (pub/sub mode)
     #[arg(long, default_value_t = 1000)]
     count: usize,
+
+    /// Number of concurrent publishers (pub/sub mode)
+    #[arg(long, default_value_t = 1)]
+    publishers: usize,
+
+    /// Duration in seconds for sustained load mode (overrides --count)
+    #[arg(long)]
+    duration: Option<u64>,
 }
 
 #[tokio::main]
@@ -41,7 +49,11 @@ async fn main() -> Result<()> {
         }
         BenchMode::PubSub => {
             let publisher = protocols::create_publisher(&args.protocol).await?;
-            publisher.start(args.payload_size, args.count).await
+            if let Some(duration) = args.duration {
+                publisher.start_timed(args.payload_size, duration, args.publishers).await
+            } else {
+                publisher.start(args.payload_size, args.count, args.publishers).await
+            }
         }
     }
 }

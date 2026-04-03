@@ -174,11 +174,34 @@ impl GrpcStreamClient {
         anyhow::bail!("gRPC server not reachable after 20 attempts")
     }
 
-    pub async fn subscribe(&self, count: usize) -> Result<usize> {
+    pub async fn subscribe(&self, count: usize, payload_size: usize, publishers: usize) -> Result<usize> {
+        if publishers <= 1 {
+            Self::subscribe_single_stream(count, payload_size).await
+        } else {
+            let base_count = count / publishers;
+            let remainder = count % publishers;
+
+            let mut handles = Vec::with_capacity(publishers);
+            for i in 0..publishers {
+                let stream_count = base_count + if i < remainder { 1 } else { 0 };
+                handles.push(tokio::spawn(
+                    Self::subscribe_single_stream(stream_count, payload_size),
+                ));
+            }
+
+            let mut total = 0;
+            for handle in handles {
+                total += handle.await??;
+            }
+            Ok(total)
+        }
+    }
+
+    async fn subscribe_single_stream(count: usize, payload_size: usize) -> Result<usize> {
         let mut client = BenchStreamClient::connect(GRPC_URL).await?;
 
         let request = StreamRequest {
-            payload_size: 1024,
+            payload_size: payload_size as u32,
             count: count as u32,
         };
 

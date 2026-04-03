@@ -157,6 +157,7 @@ pub struct PubSubResult {
     pub protocol: String,
     pub payload_size: usize,
     pub num_messages: usize,
+    pub publishers: usize,
     pub total_duration_secs: f64,
     pub throughput_msg_per_sec: f64,
     pub throughput_mb_per_sec: f64,
@@ -169,15 +170,16 @@ pub async fn run_pubsub_benchmark(
     payload_size: usize,
     num_messages: usize,
     warmup: usize,
+    publishers: usize,
 ) -> Result<PubSubResult> {
     let total_count = warmup + num_messages;
     println!(
-        "Receiving {} messages ({} warmup + {} measured, {} bytes payload)...",
-        total_count, warmup, num_messages, payload_size
+        "Receiving {} messages ({} warmup + {} measured, {} bytes payload, {} publisher(s))...",
+        total_count, warmup, num_messages, payload_size, publishers
     );
 
     let total_start = Instant::now();
-    let received = subscriber.subscribe(total_count).await?;
+    let received = subscriber.subscribe(total_count, payload_size, publishers).await?;
     let total_elapsed = total_start.elapsed();
 
     if received < total_count {
@@ -195,6 +197,7 @@ pub async fn run_pubsub_benchmark(
         protocol: protocol_name.to_string(),
         payload_size,
         num_messages,
+        publishers,
         total_duration_secs: measured_secs,
         throughput_msg_per_sec: num_messages as f64 / measured_secs,
         throughput_mb_per_sec: total_bytes as f64 / (1024.0 * 1024.0) / measured_secs,
@@ -209,6 +212,7 @@ pub fn print_pubsub_report(result: &PubSubResult) {
     println!("=== Pub/Sub Benchmark Result ===");
     println!("Protocol:       {}", result.protocol);
     println!("Payload size:   {} bytes", result.payload_size);
+    println!("Publishers:     {}", result.publishers);
     println!("Messages:       {}", result.num_messages);
     println!("Duration:       {:.3}s", result.total_duration_secs);
     println!("---");
@@ -255,4 +259,307 @@ pub fn print_pubsub_comparison(results: &[PubSubResult]) {
     }
 
     println!("╚════════════════╩═════════════════╩═════════════════════╝");
+}
+
+// ── Payload Size Sweep 報表 ──
+
+/// 格式化 payload 大小為人類可讀字串
+fn format_payload_size(size: usize) -> String {
+    if size >= 1_048_576 {
+        format!("{}MB", size / 1_048_576)
+    } else if size >= 1024 {
+        format!("{}KB", size / 1024)
+    } else {
+        format!("{}B", size)
+    }
+}
+
+/// 印出 Request/Reply sweep 矩陣（p50 延遲）
+pub fn print_rr_sweep(results: &[BenchResult], payload_sizes: &[usize]) {
+    if results.is_empty() || payload_sizes.is_empty() {
+        return;
+    }
+
+    // 收集所有出現過的協定名稱（保持排序穩定）
+    let mut protocols: Vec<String> = Vec::new();
+    for r in results {
+        if !protocols.contains(&r.protocol) {
+            protocols.push(r.protocol.clone());
+        }
+    }
+
+    let size_labels: Vec<String> = payload_sizes.iter().map(|s| format_payload_size(*s)).collect();
+
+    // 標題
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    println!("║              Request/Reply p50 Latency (us) by Payload Size                 ║");
+    println!("╠════════════════╦{}╣", "══════════╦".repeat(payload_sizes.len()).trim_end_matches('╦').to_string() + "══════════");
+
+    // 欄位標題
+    print!("║ {:14} ║", "Protocol");
+    for label in &size_labels {
+        print!(" {:>8} ║", label);
+    }
+    println!();
+    println!("╠════════════════╬{}╣", "══════════╬".repeat(payload_sizes.len()).trim_end_matches('╬').to_string() + "══════════");
+
+    // 資料行
+    for proto in &protocols {
+        print!("║ {:<14} ║", proto);
+        for size in payload_sizes {
+            let val = results
+                .iter()
+                .find(|r| r.protocol == *proto && r.payload_size == *size)
+                .map(|r| format!("{:>8.1}", r.p50_us))
+                .unwrap_or_else(|| format!("{:>8}", "-"));
+            print!(" {} ║", val);
+        }
+        println!();
+    }
+
+    println!("╚════════════════╩{}╝", "══════════╩".repeat(payload_sizes.len()).trim_end_matches('╩').to_string() + "══════════");
+}
+
+/// 印出 Pub/Sub sweep 矩陣（吞吐量 MB/s）
+pub fn print_pubsub_sweep(results: &[PubSubResult], payload_sizes: &[usize]) {
+    if results.is_empty() || payload_sizes.is_empty() {
+        return;
+    }
+
+    let mut protocols: Vec<String> = Vec::new();
+    for r in results {
+        if !protocols.contains(&r.protocol) {
+            protocols.push(r.protocol.clone());
+        }
+    }
+
+    let size_labels: Vec<String> = payload_sizes.iter().map(|s| format_payload_size(*s)).collect();
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    println!("║              Pub/Sub Throughput (MB/s) by Payload Size                      ║");
+    println!("╠════════════════╦{}╣", "══════════╦".repeat(payload_sizes.len()).trim_end_matches('╦').to_string() + "══════════");
+
+    print!("║ {:14} ║", "Protocol");
+    for label in &size_labels {
+        print!(" {:>8} ║", label);
+    }
+    println!();
+    println!("╠════════════════╬{}╣", "══════════╬".repeat(payload_sizes.len()).trim_end_matches('╬').to_string() + "══════════");
+
+    for proto in &protocols {
+        print!("║ {:<14} ║", proto);
+        for size in payload_sizes {
+            let val = results
+                .iter()
+                .find(|r| r.protocol == *proto && r.payload_size == *size)
+                .map(|r| format!("{:>8.2}", r.throughput_mb_per_sec))
+                .unwrap_or_else(|| format!("{:>8}", "-"));
+            print!(" {} ║", val);
+        }
+        println!();
+    }
+
+    println!("╚════════════════╩{}╝", "══════════╩".repeat(payload_sizes.len()).trim_end_matches('╩').to_string() + "══════════");
+}
+
+// ── Sustained Load 模式 ──
+
+/// 時間窗口快照
+#[derive(Debug, Serialize)]
+pub struct WindowSnapshot {
+    pub window_start_secs: f64,
+    pub window_end_secs: f64,
+    pub messages: usize,
+    pub throughput_msg_per_sec: f64,
+    pub throughput_mb_per_sec: f64,
+}
+
+/// Sustained Load 基準測試結果
+#[derive(Debug, Serialize)]
+pub struct SustainedResult {
+    pub protocol: String,
+    pub payload_size: usize,
+    pub publishers: usize,
+    pub duration_secs: f64,
+    pub windows: Vec<WindowSnapshot>,
+    pub total_messages: usize,
+    pub avg_throughput_msg_per_sec: f64,
+    pub avg_throughput_mb_per_sec: f64,
+}
+
+/// 執行 Sustained Load 基準測試
+pub async fn run_sustained_benchmark(
+    subscriber: &BenchSubscriber,
+    protocol_name: &str,
+    payload_size: usize,
+    duration_secs: u64,
+    window_secs: u64,
+    publishers: usize,
+) -> Result<SustainedResult> {
+    println!(
+        "Sustained load test: {} bytes payload, {}s duration, {}s windows, {} publisher(s)...",
+        payload_size, duration_secs, window_secs, publishers
+    );
+
+    let total_start = Instant::now();
+    let window_duration = std::time::Duration::from_secs(window_secs);
+    let total_duration = std::time::Duration::from_secs(duration_secs);
+    let mut windows: Vec<WindowSnapshot> = Vec::new();
+    let mut total_received: usize = 0;
+    let mut window_start = Instant::now();
+    let mut window_count: usize = 0;
+    let mut window_idx: usize = 0;
+
+    loop {
+        // 檢查是否該記錄窗口
+        if window_start.elapsed() >= window_duration {
+            let w_start = window_idx as f64 * window_secs as f64;
+            let w_end = w_start + window_secs as f64;
+            let w_secs = window_start.elapsed().as_secs_f64();
+            let msg_per_sec = window_count as f64 / w_secs;
+            let mb_per_sec = (window_count * payload_size) as f64 / (1024.0 * 1024.0) / w_secs;
+
+            println!(
+                "  [{:>5.0}-{:>5.0}s] {:>10.1} msg/s  {:>10.2} MB/s  ({} msgs)",
+                w_start, w_end, msg_per_sec, mb_per_sec, window_count
+            );
+
+            windows.push(WindowSnapshot {
+                window_start_secs: w_start,
+                window_end_secs: w_end,
+                messages: window_count,
+                throughput_msg_per_sec: msg_per_sec,
+                throughput_mb_per_sec: mb_per_sec,
+            });
+
+            window_idx += 1;
+            window_count = 0;
+            window_start = Instant::now();
+
+            if total_start.elapsed() >= total_duration {
+                break;
+            }
+            continue;
+        }
+
+        // 嘗試接收訊息
+        let remaining = window_duration.saturating_sub(window_start.elapsed());
+        match tokio::time::timeout(remaining, subscriber.subscribe(1, payload_size, publishers))
+            .await
+        {
+            Ok(Ok(n)) => {
+                window_count += n;
+                total_received += n;
+            }
+            Ok(Err(_)) => break,
+            Err(_) => {} // 窗口超時
+        }
+
+        if total_start.elapsed() >= total_duration {
+            // 記錄最後不完整窗口
+            if window_count > 0 {
+                let w_start = window_idx as f64 * window_secs as f64;
+                let w_secs = window_start.elapsed().as_secs_f64();
+                let w_end = w_start + w_secs;
+                let msg_per_sec = window_count as f64 / w_secs;
+                let mb_per_sec =
+                    (window_count * payload_size) as f64 / (1024.0 * 1024.0) / w_secs;
+
+                windows.push(WindowSnapshot {
+                    window_start_secs: w_start,
+                    window_end_secs: w_end,
+                    messages: window_count,
+                    throughput_msg_per_sec: msg_per_sec,
+                    throughput_mb_per_sec: mb_per_sec,
+                });
+            }
+            break;
+        }
+    }
+
+    let actual_duration = total_start.elapsed().as_secs_f64();
+    let avg_msg = if actual_duration > 0.0 {
+        total_received as f64 / actual_duration
+    } else {
+        0.0
+    };
+    let avg_mb = if actual_duration > 0.0 {
+        (total_received * payload_size) as f64 / (1024.0 * 1024.0) / actual_duration
+    } else {
+        0.0
+    };
+
+    Ok(SustainedResult {
+        protocol: protocol_name.to_string(),
+        payload_size,
+        publishers,
+        duration_secs: actual_duration,
+        windows,
+        total_messages: total_received,
+        avg_throughput_msg_per_sec: avg_msg,
+        avg_throughput_mb_per_sec: avg_mb,
+    })
+}
+
+/// 印出 Sustained Load 單項結果
+pub fn print_sustained_report(result: &SustainedResult) {
+    println!();
+    println!("=== Sustained Load Result ===");
+    println!("Protocol:       {}", result.protocol);
+    println!("Payload size:   {} bytes", result.payload_size);
+    println!("Publishers:     {}", result.publishers);
+    println!("Duration:       {:.1}s", result.duration_secs);
+    println!("Total messages: {}", result.total_messages);
+    println!("---");
+    println!("Avg throughput:");
+    println!("  {:>10.1} msg/s", result.avg_throughput_msg_per_sec);
+    println!("  {:>10.2} MB/s", result.avg_throughput_mb_per_sec);
+
+    if !result.windows.is_empty() {
+        println!("---");
+        println!("╔══════════════╦═════════════════╦═════════════════════╗");
+        println!("║ Window       ║     msg/s       ║       MB/s          ║");
+        println!("╠══════════════╬═════════════════╬═════════════════════╣");
+        for w in &result.windows {
+            println!(
+                "║ {:>5.0}-{:<5.0}s ║ {:>13.1}   ║ {:>13.2}       ║",
+                w.window_start_secs, w.window_end_secs, w.throughput_msg_per_sec, w.throughput_mb_per_sec
+            );
+        }
+        println!("╚══════════════╩═════════════════╩═════════════════════╝");
+    }
+
+    println!("=============================");
+}
+
+/// 印出 Sustained Load 比較表格（依平均吞吐量排序）
+pub fn print_sustained_comparison(results: &[SustainedResult]) {
+    if results.is_empty() {
+        return;
+    }
+
+    let mut sorted: Vec<&SustainedResult> = results.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.avg_throughput_msg_per_sec
+            .partial_cmp(&a.avg_throughput_msg_per_sec)
+            .unwrap()
+    });
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║   Sustained Load Comparison (avg throughput)                    ║");
+    println!("╠════════════════╦═════════════════╦═════════════════╦════════════╣");
+    println!("║ Protocol       ║     msg/s       ║       MB/s      ║ duration   ║");
+    println!("╠════════════════╬═════════════════╬═════════════════╬════════════╣");
+
+    for r in &sorted {
+        println!(
+            "║ {:<14} ║ {:>13.1}   ║ {:>13.2}   ║ {:>7.1}s   ║",
+            r.protocol, r.avg_throughput_msg_per_sec, r.avg_throughput_mb_per_sec, r.duration_secs
+        );
+    }
+
+    println!("╚════════════════╩═════════════════╩═════════════════╩════════════╝");
 }

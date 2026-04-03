@@ -3,6 +3,8 @@
 // 僅透過設定切換傳輸方式 — 這是 Zenoh 的核心優勢
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tokio::time::{sleep, Duration};
@@ -313,14 +315,7 @@ impl ZenohBenchPublisher {
         Ok(Self { session, use_shm })
     }
 
-    pub async fn start(&self, payload_size: usize, count: usize) -> Result<()> {
-        let publisher = self
-            .session
-            .declare_publisher(PUBSUB_KEY_EXPR)
-            .congestion_control(CongestionControl::Block)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
-
+    pub async fn start(&self, payload_size: usize, count: usize, publishers: usize) -> Result<()> {
         // 就緒信號：等待訂閱者查詢後才開始發佈
         let ready = self
             .session
@@ -332,18 +327,201 @@ impl ZenohBenchPublisher {
         if let Ok(query) = ready.recv_async().await {
             let _ = query.reply(query.key_expr().clone(), "ready").await;
         }
-        println!("[Publisher] Subscriber connected, publishing {} messages", count);
+        println!(
+            "[Publisher] Subscriber connected, publishing {} messages with {} publisher(s)",
+            count, publishers
+        );
 
         let payload: Vec<u8> = (0..payload_size).map(|i| i as u8).collect();
 
-        if self.use_shm {
-            self.publish_shm(&publisher, payload_size, count, &payload).await
+        if publishers <= 1 {
+            // 單一 publisher（原始路徑）
+            let publisher = self
+                .session
+                .declare_publisher(PUBSUB_KEY_EXPR)
+                .congestion_control(CongestionControl::Drop)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+            if self.use_shm {
+                self.publish_shm(&publisher, payload_size, count, &payload).await
+            } else {
+                self.publish_regular(&publisher, count, &payload).await
+            }
         } else {
-            self.publish_regular(&publisher, count, &payload).await
+            // 多 publisher 併發
+            self.publish_concurrent(payload_size, count, publishers, &payload).await
         }
     }
 
+    /// 多 publisher 併發發佈
+    async fn publish_concurrent(
+        &self,
+        payload_size: usize,
+        count: usize,
+        publishers: usize,
+        payload: &[u8],
+    ) -> Result<()> {
+        let base_count = count / publishers;
+        let remainder = count % publishers;
+        let payload = payload.to_vec();
+        let use_shm = self.use_shm;
+
+        let mut handles = Vec::with_capacity(publishers);
+
+        for i in 0..publishers {
+            let task_count = base_count + if i < remainder { 1 } else { 0 };
+            let session = self.session.clone();
+            let task_payload = payload.clone();
+
+            let handle = tokio::spawn(async move {
+                let publisher = session
+                    .declare_publisher(PUBSUB_KEY_EXPR)
+                    .congestion_control(CongestionControl::Drop)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to declare publisher {}: {}", i, e))?;
+
+                if use_shm {
+                    let pool_size = 64;
+                    let backend = PosixShmProviderBackend::builder(payload_size * pool_size)
+                        .wait()
+                        .map_err(|e| anyhow::anyhow!("Failed to create SHM backend: {}", e))?;
+                    let shm_provider = ShmProviderBuilder::backend(backend).wait();
+                    let layout = shm_provider
+                        .alloc_layout(payload_size)
+                        .map_err(|e| anyhow::anyhow!("Failed to create SHM layout: {}", e))?;
+
+                    for batch_start in (0..task_count).step_by(pool_size) {
+                        let batch_end = (batch_start + pool_size).min(task_count);
+                        let batch_count = batch_end - batch_start;
+
+                        let mut batch = Vec::with_capacity(batch_count);
+                        for _ in 0..batch_count {
+                            let mut sbuf = layout
+                                .alloc()
+                                .with_policy::<BlockOn<GarbageCollect>>()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("SHM alloc failed: {:?}", e))?;
+                            sbuf[..payload_size].copy_from_slice(&task_payload);
+                            batch.push(sbuf);
+                        }
+
+                        for sbuf in batch {
+                            if let Err(e) = publisher.put(sbuf).await {
+                                eprintln!("[Publisher {}] Publish failed: {}", i, e);
+                            }
+                        }
+                    }
+                } else {
+                    for _ in 0..task_count {
+                        if let Err(e) = publisher.put(task_payload.clone()).await {
+                            eprintln!("[Publisher {}] Publish failed: {}", i, e);
+                        }
+                    }
+                }
+
+                Ok::<(), anyhow::Error>(())
+            });
+
+            handles.push(handle);
+        }
+
+        // 等待所有 publisher 完成
+        for (i, handle) in handles.into_iter().enumerate() {
+            if let Err(e) = handle.await? {
+                eprintln!("[Publisher {}] Task failed: {}", i, e);
+            }
+        }
+
+        println!("[Publisher] Done publishing {} messages across {} publishers", count, publishers);
+        sleep(Duration::from_secs(1)).await;
+        Ok(())
+    }
+
+    /// 時間限制模式：持續發送直到 duration 結束
+    pub async fn start_timed(&self, payload_size: usize, duration_secs: u64, publishers: usize) -> Result<()> {
+        // 就緒信號
+        let ready = self
+            .session
+            .declare_queryable(PUBSUB_READY_KEY)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare ready queryable: {}", e))?;
+
+        println!("[Publisher] Waiting for subscriber...");
+        if let Ok(query) = ready.recv_async().await {
+            let _ = query.reply(query.key_expr().clone(), "ready").await;
+        }
+        println!(
+            "[Publisher] Subscriber connected, timed mode: {}s, {} publisher(s)",
+            duration_secs, publishers
+        );
+
+        let payload: Vec<u8> = (0..payload_size).map(|i| i as u8).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let use_shm = self.use_shm;
+
+        let mut handles = Vec::with_capacity(publishers);
+
+        for i in 0..publishers {
+            let session = self.session.clone();
+            let task_payload = payload.clone();
+            let stop = stop.clone();
+
+            let handle = tokio::spawn(async move {
+                let publisher = session
+                    .declare_publisher(PUBSUB_KEY_EXPR)
+                    .congestion_control(CongestionControl::Drop)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to declare publisher {}: {}", i, e))?;
+
+                if use_shm {
+                    let pool_size = 64;
+                    let backend = PosixShmProviderBackend::builder(payload_size * pool_size)
+                        .wait()
+                        .map_err(|e| anyhow::anyhow!("Failed to create SHM backend: {}", e))?;
+                    let shm_provider = ShmProviderBuilder::backend(backend).wait();
+                    let layout = shm_provider
+                        .alloc_layout(payload_size)
+                        .map_err(|e| anyhow::anyhow!("Failed to create SHM layout: {}", e))?;
+
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut sbuf = layout
+                            .alloc()
+                            .with_policy::<BlockOn<GarbageCollect>>()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("SHM alloc failed: {:?}", e))?;
+                        sbuf[..payload_size].copy_from_slice(&task_payload);
+                        let _ = publisher.put(sbuf).await;
+                    }
+                } else {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = publisher.put(task_payload.clone()).await;
+                    }
+                }
+
+                Ok::<(), anyhow::Error>(())
+            });
+
+            handles.push(handle);
+        }
+
+        // 等待 duration 後設置停止信號
+        sleep(Duration::from_secs(duration_secs)).await;
+        stop.store(true, Ordering::Relaxed);
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            if let Err(e) = handle.await? {
+                eprintln!("[Publisher {}] Task failed: {}", i, e);
+            }
+        }
+
+        println!("[Publisher] Timed mode completed ({}s)", duration_secs);
+        sleep(Duration::from_secs(1)).await;
+        Ok(())
+    }
+
     /// 使用 SHM buffer 發佈（真正的 zero-copy）
+    /// 使用批次預分配 buffer pool，避免逐條分配觸發 GC 阻塞
     async fn publish_shm(
         &self,
         publisher: &zenoh::pubsub::Publisher<'_>,
@@ -351,7 +529,8 @@ impl ZenohBenchPublisher {
         count: usize,
         payload: &[u8],
     ) -> Result<()> {
-        let backend = PosixShmProviderBackend::builder(payload_size * 64)
+        let pool_size = 64;
+        let backend = PosixShmProviderBackend::builder(payload_size * pool_size)
             .wait()
             .map_err(|e| anyhow::anyhow!("Failed to create SHM backend: {}", e))?;
         let shm_provider = ShmProviderBuilder::backend(backend).wait();
@@ -359,19 +538,31 @@ impl ZenohBenchPublisher {
             .alloc_layout(payload_size)
             .map_err(|e| anyhow::anyhow!("Failed to create SHM layout: {}", e))?;
 
-        println!("[Publisher] SHM mode enabled");
+        println!("[Publisher] SHM mode enabled (batch pool size: {})", pool_size);
 
-        for _ in 0..count {
-            let mut sbuf = layout
-                .alloc()
-                .with_policy::<BlockOn<GarbageCollect>>()
-                .await
-                .map_err(|e| anyhow::anyhow!("SHM alloc failed: {:?}", e))?;
+        // 批次預分配：每次分配一批 buffer，填入 payload，然後批次發送
+        // 避免交錯分配+發送導致 GC 阻塞
+        for batch_start in (0..count).step_by(pool_size) {
+            let batch_end = (batch_start + pool_size).min(count);
+            let batch_count = batch_end - batch_start;
 
-            sbuf[..payload_size].copy_from_slice(payload);
+            // 預分配整批 buffer
+            let mut batch = Vec::with_capacity(batch_count);
+            for _ in 0..batch_count {
+                let mut sbuf = layout
+                    .alloc()
+                    .with_policy::<BlockOn<GarbageCollect>>()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("SHM alloc failed: {:?}", e))?;
+                sbuf[..payload_size].copy_from_slice(payload);
+                batch.push(sbuf);
+            }
 
-            if let Err(e) = publisher.put(sbuf).await {
-                eprintln!("[Publisher] Publish failed: {}", e);
+            // 批次發送
+            for sbuf in batch {
+                if let Err(e) = publisher.put(sbuf).await {
+                    eprintln!("[Publisher] Publish failed: {}", e);
+                }
             }
         }
 

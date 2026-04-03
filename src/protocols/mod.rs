@@ -148,11 +148,27 @@ pub enum BenchPublisher {
 }
 
 impl BenchPublisher {
-    pub async fn start(&self, payload_size: usize, count: usize) -> Result<()> {
+    pub async fn start(&self, payload_size: usize, count: usize, publishers: usize) -> Result<()> {
         match self {
-            BenchPublisher::Zenoh(p) => p.start(payload_size, count).await,
+            BenchPublisher::Zenoh(p) => p.start(payload_size, count, publishers).await,
             BenchPublisher::Http(p) => p.start(payload_size, count).await,
             BenchPublisher::Grpc(p) => p.start(payload_size, count).await,
+        }
+    }
+
+    /// 時間限制模式：持續發送直到 duration 結束
+    pub async fn start_timed(&self, payload_size: usize, duration_secs: u64, publishers: usize) -> Result<()> {
+        match self {
+            BenchPublisher::Zenoh(p) => p.start_timed(payload_size, duration_secs, publishers).await,
+            BenchPublisher::Http(p) => {
+                // HTTP: 使用一個很大的 count 讓串流持續，client 端會在 duration 後斷開
+                let large_count = 10_000_000;
+                p.start(payload_size, large_count).await
+            }
+            BenchPublisher::Grpc(p) => {
+                let large_count = 10_000_000;
+                p.start(payload_size, large_count).await
+            }
         }
     }
 }
@@ -165,11 +181,11 @@ pub enum BenchSubscriber {
 }
 
 impl BenchSubscriber {
-    pub async fn subscribe(&self, count: usize) -> Result<usize> {
+    pub async fn subscribe(&self, count: usize, payload_size: usize, publishers: usize) -> Result<usize> {
         match self {
             BenchSubscriber::Zenoh(s) => s.subscribe(count).await,
-            BenchSubscriber::Http(s) => s.subscribe(count).await,
-            BenchSubscriber::Grpc(s) => s.subscribe(count).await,
+            BenchSubscriber::Http(s) => s.subscribe(count, payload_size, publishers).await,
+            BenchSubscriber::Grpc(s) => s.subscribe(count, payload_size, publishers).await,
         }
     }
 }
