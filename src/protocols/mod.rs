@@ -7,6 +7,22 @@ pub mod zenoh_common;
 
 use anyhow::Result;
 
+/// 基準測試模式
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum BenchMode {
+    RequestReply,
+    PubSub,
+}
+
+impl std::fmt::Display for BenchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BenchMode::RequestReply => write!(f, "request-reply"),
+            BenchMode::PubSub => write!(f, "pubsub"),
+        }
+    }
+}
+
 /// 支援的通訊協定
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum Protocol {
@@ -118,6 +134,82 @@ pub async fn create_client(protocol: &Protocol) -> Result<BenchClient> {
         Protocol::Grpc => {
             let client = grpc::GrpcClient::new().await?;
             Ok(BenchClient::Grpc(client))
+        }
+    }
+}
+
+// ── Pub/Sub 模式 ──
+
+/// 發佈者 enum dispatch
+pub enum BenchPublisher {
+    Zenoh(zenoh_common::ZenohBenchPublisher),
+    Http(http::HttpStreamServer),
+    Grpc(grpc::GrpcStreamServer),
+}
+
+impl BenchPublisher {
+    pub async fn start(&self, payload_size: usize, count: usize) -> Result<()> {
+        match self {
+            BenchPublisher::Zenoh(p) => p.start(payload_size, count).await,
+            BenchPublisher::Http(p) => p.start(payload_size, count).await,
+            BenchPublisher::Grpc(p) => p.start(payload_size, count).await,
+        }
+    }
+}
+
+/// 訂閱者 enum dispatch
+pub enum BenchSubscriber {
+    Zenoh(zenoh_common::ZenohBenchSubscriber),
+    Http(http::HttpStreamClient),
+    Grpc(grpc::GrpcStreamClient),
+}
+
+impl BenchSubscriber {
+    pub async fn subscribe(&self, count: usize) -> Result<usize> {
+        match self {
+            BenchSubscriber::Zenoh(s) => s.subscribe(count).await,
+            BenchSubscriber::Http(s) => s.subscribe(count).await,
+            BenchSubscriber::Grpc(s) => s.subscribe(count).await,
+        }
+    }
+}
+
+/// 根據協定建立發佈者
+pub async fn create_publisher(protocol: &Protocol) -> Result<BenchPublisher> {
+    match protocol {
+        Protocol::ZenohShm
+        | Protocol::ZenohUnix
+        | Protocol::ZenohTcp
+        | Protocol::ZenohTls
+        | Protocol::ZenohQuic
+        | Protocol::ZenohWs => {
+            let publisher = zenoh_common::ZenohBenchPublisher::new(protocol).await?;
+            Ok(BenchPublisher::Zenoh(publisher))
+        }
+        Protocol::Http => Ok(BenchPublisher::Http(http::HttpStreamServer)),
+        Protocol::Grpc => Ok(BenchPublisher::Grpc(grpc::GrpcStreamServer)),
+    }
+}
+
+/// 根據協定建立訂閱者
+pub async fn create_subscriber(protocol: &Protocol) -> Result<BenchSubscriber> {
+    match protocol {
+        Protocol::ZenohShm
+        | Protocol::ZenohUnix
+        | Protocol::ZenohTcp
+        | Protocol::ZenohTls
+        | Protocol::ZenohQuic
+        | Protocol::ZenohWs => {
+            let subscriber = zenoh_common::ZenohBenchSubscriber::new(protocol).await?;
+            Ok(BenchSubscriber::Zenoh(subscriber))
+        }
+        Protocol::Http => {
+            let subscriber = http::HttpStreamClient::new().await?;
+            Ok(BenchSubscriber::Http(subscriber))
+        }
+        Protocol::Grpc => {
+            let subscriber = grpc::GrpcStreamClient::new().await?;
+            Ok(BenchSubscriber::Grpc(subscriber))
         }
     }
 }

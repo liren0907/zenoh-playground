@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use zenoh_playground::bench;
-use zenoh_playground::protocols::{self, Protocol};
+use zenoh_playground::protocols::{self, BenchMode, Protocol};
 
 #[derive(Parser)]
 #[command(name = "bench-client", about = "Benchmark client")]
@@ -13,6 +13,10 @@ struct Args {
     /// Communication protocol to use
     #[arg(long, value_enum, default_value_t = Protocol::ZenohTcp)]
     protocol: Protocol,
+
+    /// Benchmark mode
+    #[arg(long, value_enum, default_value_t = BenchMode::RequestReply)]
+    mode: BenchMode,
 
     /// Payload size in bytes per request
     #[arg(long, default_value_t = 1024)]
@@ -35,28 +39,49 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     println!(
-        "Starting benchmark: protocol={}, payload={}B, iterations={}",
-        args.protocol, args.payload_size, args.iterations
+        "Starting benchmark: protocol={}, mode={}, payload={}B",
+        args.protocol, args.mode, args.payload_size
     );
 
-    let client = protocols::create_client(&args.protocol).await?;
+    match args.mode {
+        BenchMode::RequestReply => {
+            let client = protocols::create_client(&args.protocol).await?;
+            let result = bench::run_benchmark(
+                &client,
+                &args.protocol.to_string(),
+                args.payload_size,
+                args.iterations,
+                args.warmup,
+            )
+            .await?;
 
-    let result = bench::run_benchmark(
-        &client,
-        &args.protocol.to_string(),
-        args.payload_size,
-        args.iterations,
-        args.warmup,
-    )
-    .await?;
+            bench::print_report(&result);
 
-    bench::print_report(&result);
+            if let Some(path) = &args.json_output {
+                let json = serde_json::to_string_pretty(&result)?;
+                std::fs::write(path, &json)?;
+                println!("Results written to {}", path);
+            }
+        }
+        BenchMode::PubSub => {
+            let subscriber = protocols::create_subscriber(&args.protocol).await?;
+            let result = bench::run_pubsub_benchmark(
+                &subscriber,
+                &args.protocol.to_string(),
+                args.payload_size,
+                args.iterations,
+                args.warmup,
+            )
+            .await?;
 
-    // 輸出 JSON 結果（如果有指定）
-    if let Some(path) = &args.json_output {
-        let json = serde_json::to_string_pretty(&result)?;
-        std::fs::write(path, &json)?;
-        println!("Results written to {}", path);
+            bench::print_pubsub_report(&result);
+
+            if let Some(path) = &args.json_output {
+                let json = serde_json::to_string_pretty(&result)?;
+                std::fs::write(path, &json)?;
+                println!("Results written to {}", path);
+            }
+        }
     }
 
     Ok(())

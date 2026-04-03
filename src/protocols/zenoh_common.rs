@@ -6,11 +6,15 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use tokio::time::{sleep, Duration};
-use zenoh::{Config, Session};
+use zenoh::qos::CongestionControl;
+use zenoh::shm::{BlockOn, GarbageCollect, PosixShmProviderBackend, ShmProviderBuilder};
+use zenoh::{Config, Session, Wait};
 
 use super::Protocol;
 
 const BENCH_KEY_EXPR: &str = "bench/echo";
+const PUBSUB_KEY_EXPR: &str = "bench/stream";
+const PUBSUB_READY_KEY: &str = "bench/stream/ready";
 const CERT_DIR: &str = "/tmp/zenoh-bench-certs";
 
 /// 根據協定回傳伺服器端監聽的端點 URL
@@ -283,5 +287,170 @@ impl ZenohClient {
             .map_err(|e| anyhow::anyhow!("Reply error: {:?}", e))?;
 
         Ok(sample.payload().to_bytes().to_vec())
+    }
+}
+
+// ── Pub/Sub 模式（純吞吐量測量） ──
+
+/// Zenoh Pub/Sub 發佈者（支援 SHM zero-copy）
+pub struct ZenohBenchPublisher {
+    session: Session,
+    use_shm: bool,
+}
+
+impl ZenohBenchPublisher {
+    pub async fn new(protocol: &Protocol) -> Result<Self> {
+        if matches!(protocol, Protocol::ZenohUnix) {
+            let _ = std::fs::remove_file("/tmp/zenoh-bench.sock");
+        }
+
+        let use_shm = needs_shm(protocol);
+        let config = server_config(protocol)?;
+        let session = zenoh::open(config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open Zenoh publisher session: {}", e))?;
+
+        Ok(Self { session, use_shm })
+    }
+
+    pub async fn start(&self, payload_size: usize, count: usize) -> Result<()> {
+        let publisher = self
+            .session
+            .declare_publisher(PUBSUB_KEY_EXPR)
+            .congestion_control(CongestionControl::Block)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+        // 就緒信號：等待訂閱者查詢後才開始發佈
+        let ready = self
+            .session
+            .declare_queryable(PUBSUB_READY_KEY)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare ready queryable: {}", e))?;
+
+        println!("[Publisher] Waiting for subscriber...");
+        if let Ok(query) = ready.recv_async().await {
+            let _ = query.reply(query.key_expr().clone(), "ready").await;
+        }
+        println!("[Publisher] Subscriber connected, publishing {} messages", count);
+
+        let payload: Vec<u8> = (0..payload_size).map(|i| i as u8).collect();
+
+        if self.use_shm {
+            self.publish_shm(&publisher, payload_size, count, &payload).await
+        } else {
+            self.publish_regular(&publisher, count, &payload).await
+        }
+    }
+
+    /// 使用 SHM buffer 發佈（真正的 zero-copy）
+    async fn publish_shm(
+        &self,
+        publisher: &zenoh::pubsub::Publisher<'_>,
+        payload_size: usize,
+        count: usize,
+        payload: &[u8],
+    ) -> Result<()> {
+        let backend = PosixShmProviderBackend::builder(payload_size * 64)
+            .wait()
+            .map_err(|e| anyhow::anyhow!("Failed to create SHM backend: {}", e))?;
+        let shm_provider = ShmProviderBuilder::backend(backend).wait();
+        let layout = shm_provider
+            .alloc_layout(payload_size)
+            .map_err(|e| anyhow::anyhow!("Failed to create SHM layout: {}", e))?;
+
+        println!("[Publisher] SHM mode enabled");
+
+        for _ in 0..count {
+            let mut sbuf = layout
+                .alloc()
+                .with_policy::<BlockOn<GarbageCollect>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("SHM alloc failed: {:?}", e))?;
+
+            sbuf[..payload_size].copy_from_slice(payload);
+
+            if let Err(e) = publisher.put(sbuf).await {
+                eprintln!("[Publisher] Publish failed: {}", e);
+            }
+        }
+
+        println!("[Publisher] Done publishing {} messages", count);
+        sleep(Duration::from_secs(1)).await;
+        Ok(())
+    }
+
+    /// 一般發佈（非 SHM）
+    async fn publish_regular(
+        &self,
+        publisher: &zenoh::pubsub::Publisher<'_>,
+        count: usize,
+        payload: &[u8],
+    ) -> Result<()> {
+        for _ in 0..count {
+            if let Err(e) = publisher.put(payload.to_vec()).await {
+                eprintln!("[Publisher] Publish failed: {}", e);
+            }
+        }
+
+        println!("[Publisher] Done publishing {} messages", count);
+        sleep(Duration::from_secs(1)).await;
+        Ok(())
+    }
+}
+
+/// Zenoh Pub/Sub 訂閱者
+pub struct ZenohBenchSubscriber {
+    session: Session,
+}
+
+impl ZenohBenchSubscriber {
+    pub async fn new(protocol: &Protocol) -> Result<Self> {
+        let config = client_config(protocol)?;
+        let session = zenoh::open(config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open Zenoh subscriber session: {}", e))?;
+
+        Ok(Self { session })
+    }
+
+    pub async fn subscribe(&self, count: usize) -> Result<usize> {
+        let subscriber = self
+            .session
+            .declare_subscriber(PUBSUB_KEY_EXPR)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare subscriber: {}", e))?;
+
+        // 通知發佈者開始
+        println!("[Subscriber] Signaling publisher to start...");
+        let mut delay = Duration::from_millis(100);
+        for attempt in 1..=20 {
+            match self.session.get(PUBSUB_READY_KEY).await {
+                Ok(replies) => {
+                    if replies.recv_async().await.is_ok() {
+                        println!("[Subscriber] Publisher is ready (attempt {})", attempt);
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            if attempt == 20 {
+                anyhow::bail!("Publisher not reachable after 20 attempts");
+            }
+            sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
+
+        // 接收訊息，只計數
+        let mut received = 0;
+        for _ in 0..count {
+            subscriber
+                .recv_async()
+                .await
+                .map_err(|e| anyhow::anyhow!("Subscriber recv failed: {}", e))?;
+            received += 1;
+        }
+
+        Ok(received)
     }
 }

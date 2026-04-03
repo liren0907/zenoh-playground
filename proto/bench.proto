@@ -13,3 +13,16 @@ message EchoRequest {
 message EchoResponse {
   bytes data = 1;
 }
+
+service BenchStream {
+  rpc StreamData(StreamRequest) returns (stream StreamResponse);
+}
+
+message StreamRequest {
+  uint32 payload_size = 1;
+  uint32 count = 2;
+}
+
+message StreamResponse {
+  bytes data = 1;
+}

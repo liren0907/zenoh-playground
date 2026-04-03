@@ -6,7 +6,7 @@ use anyhow::Result;
 use rand::RngCore;
 use serde::Serialize;
 
-use crate::protocols::BenchClient;
+use crate::protocols::{BenchClient, BenchSubscriber};
 
 /// 基準測試結果
 #[derive(Debug, Serialize)]
@@ -147,4 +147,112 @@ pub fn print_comparison(results: &[BenchResult]) {
     }
 
     println!("╚════════════════╩══════════╩══════════╩══════════╩══════════╩═════════════════╝");
+}
+
+// ── Pub/Sub 模式（純吞吐量測量） ──
+
+/// Pub/Sub 基準測試結果
+#[derive(Debug, Serialize)]
+pub struct PubSubResult {
+    pub protocol: String,
+    pub payload_size: usize,
+    pub num_messages: usize,
+    pub total_duration_secs: f64,
+    pub throughput_msg_per_sec: f64,
+    pub throughput_mb_per_sec: f64,
+}
+
+/// 執行 Pub/Sub 基準測試（純吞吐量）
+pub async fn run_pubsub_benchmark(
+    subscriber: &BenchSubscriber,
+    protocol_name: &str,
+    payload_size: usize,
+    num_messages: usize,
+    warmup: usize,
+) -> Result<PubSubResult> {
+    let total_count = warmup + num_messages;
+    println!(
+        "Receiving {} messages ({} warmup + {} measured, {} bytes payload)...",
+        total_count, warmup, num_messages, payload_size
+    );
+
+    let total_start = Instant::now();
+    let received = subscriber.subscribe(total_count).await?;
+    let total_elapsed = total_start.elapsed();
+
+    if received < total_count {
+        anyhow::bail!(
+            "Only received {} of {} messages",
+            received,
+            total_count
+        );
+    }
+
+    let total_bytes = payload_size * num_messages;
+    let measured_secs = total_elapsed.as_secs_f64() * (num_messages as f64 / total_count as f64);
+
+    let result = PubSubResult {
+        protocol: protocol_name.to_string(),
+        payload_size,
+        num_messages,
+        total_duration_secs: measured_secs,
+        throughput_msg_per_sec: num_messages as f64 / measured_secs,
+        throughput_mb_per_sec: total_bytes as f64 / (1024.0 * 1024.0) / measured_secs,
+    };
+
+    Ok(result)
+}
+
+/// 印出 Pub/Sub 單項結果
+pub fn print_pubsub_report(result: &PubSubResult) {
+    println!();
+    println!("=== Pub/Sub Benchmark Result ===");
+    println!("Protocol:       {}", result.protocol);
+    println!("Payload size:   {} bytes", result.payload_size);
+    println!("Messages:       {}", result.num_messages);
+    println!("Duration:       {:.3}s", result.total_duration_secs);
+    println!("---");
+    println!("Throughput:");
+    println!("  {:>10.1} msg/s", result.throughput_msg_per_sec);
+    println!("  {:>10.2} MB/s", result.throughput_mb_per_sec);
+    println!("================================");
+}
+
+/// 印出 Pub/Sub 比較表格（依吞吐量排序）
+pub fn print_pubsub_comparison(results: &[PubSubResult]) {
+    if results.is_empty() {
+        return;
+    }
+
+    let mut sorted: Vec<&PubSubResult> = results.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.throughput_msg_per_sec
+            .partial_cmp(&a.throughput_msg_per_sec)
+            .unwrap()
+    });
+
+    let payload_desc = if sorted
+        .iter()
+        .all(|r| r.payload_size == sorted[0].payload_size)
+    {
+        format!("{} bytes", sorted[0].payload_size)
+    } else {
+        "mixed".to_string()
+    };
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║   Pub/Sub Throughput Comparison (payload: {:>10})   ║", payload_desc);
+    println!("╠════════════════╦═════════════════╦═════════════════════╣");
+    println!("║ Protocol       ║     msg/s       ║       MB/s          ║");
+    println!("╠════════════════╬═════════════════╬═════════════════════╣");
+
+    for r in &sorted {
+        println!(
+            "║ {:<14} ║ {:>13.1}   ║ {:>13.2}       ║",
+            r.protocol, r.throughput_msg_per_sec, r.throughput_mb_per_sec
+        );
+    }
+
+    println!("╚════════════════╩═════════════════╩═════════════════════╝");
 }

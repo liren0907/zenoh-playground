@@ -5,14 +5,25 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use zenoh_playground::bench;
 use zenoh_playground::protocols::{self, ALL_PROTOCOLS, Protocol};
 
+#[derive(Debug, Clone, ValueEnum)]
+enum RunMode {
+    All,
+    RequestReply,
+    PubSub,
+}
+
 #[derive(Parser)]
 #[command(name = "bench-all", about = "Run benchmarks for all protocols")]
 struct Args {
+    /// Which benchmark modes to run
+    #[arg(long, value_enum, default_value_t = RunMode::All)]
+    mode: RunMode,
+
     /// Payload size in bytes per request
     #[arg(long, default_value_t = 1024)]
     payload_size: usize,
@@ -30,21 +41,28 @@ struct Args {
     json_output: Option<String>,
 }
 
-/// 啟動 bench-server 子程序
-fn start_server(protocol: &Protocol) -> Result<Child> {
-    let child = Command::new(server_binary_path())
-        .args(["--protocol", &protocol.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(child)
-}
-
-/// 取得 bench-server 的路徑（與自身在同一目錄）
 fn server_binary_path() -> std::path::PathBuf {
     let mut path = std::env::current_exe().expect("Failed to get current exe path");
     path.set_file_name("bench-server");
     path
+}
+
+fn start_server(protocol: &Protocol, mode: &str, payload_size: usize, count: usize) -> Result<Child> {
+    let child = Command::new(server_binary_path())
+        .args([
+            "--protocol",
+            &protocol.to_string(),
+            "--mode",
+            mode,
+            "--payload-size",
+            &payload_size.to_string(),
+            "--count",
+            &count.to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(child)
 }
 
 #[tokio::main]
@@ -53,72 +71,143 @@ async fn main() -> Result<()> {
 
     println!("=== Running all protocol benchmarks ===");
     println!(
-        "Payload: {} bytes, Iterations: {}, Warmup: {}",
-        args.payload_size, args.iterations, args.warmup
+        "Mode: {:?}, Payload: {} bytes, Iterations: {}, Warmup: {}",
+        args.mode, args.payload_size, args.iterations, args.warmup
     );
     println!();
 
-    let mut results: Vec<bench::BenchResult> = Vec::new();
+    let run_rr = matches!(args.mode, RunMode::All | RunMode::RequestReply);
+    let run_ps = matches!(args.mode, RunMode::All | RunMode::PubSub);
 
-    for protocol in ALL_PROTOCOLS {
-        println!("────────────────────────────────────────");
-        println!("Protocol: {}", protocol);
-        println!("────────────────────────────────────────");
+    let mut rr_results: Vec<bench::BenchResult> = Vec::new();
+    let mut ps_results: Vec<bench::PubSubResult> = Vec::new();
 
-        // 啟動伺服器子程序
-        let mut server = match start_server(protocol) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  Failed to start server: {}", e);
-                continue;
+    // ── Request/Reply 模式 ──
+    if run_rr {
+        println!("══════════════════════════════════════════");
+        println!("  Request/Reply Benchmark");
+        println!("══════════════════════════════════════════");
+
+        for protocol in ALL_PROTOCOLS {
+            println!("────────────────────────────────────────");
+            println!("Protocol: {}", protocol);
+            println!("────────────────────────────────────────");
+
+            let mut server = match start_server(protocol, "request-reply", args.payload_size, 0) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  Failed to start server: {}", e);
+                    continue;
+                }
+            };
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let result = async {
+                let client = protocols::create_client(protocol).await?;
+                let r = bench::run_benchmark(
+                    &client,
+                    &protocol.to_string(),
+                    args.payload_size,
+                    args.iterations,
+                    args.warmup,
+                )
+                .await;
+                drop(client);
+                r
             }
-        };
-
-        // 等待伺服器啟動
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // 建立客戶端並執行 benchmark（在獨立 scope 內確保資源釋放）
-        let result = async {
-            let client = protocols::create_client(protocol).await?;
-            let r = bench::run_benchmark(
-                &client,
-                &protocol.to_string(),
-                args.payload_size,
-                args.iterations,
-                args.warmup,
-            )
             .await;
-            // 明確 drop 客戶端，釋放 Zenoh session 和網路連線
-            drop(client);
-            r
-        }
-        .await;
 
-        // 停止伺服器
-        let _ = server.kill();
-        let _ = server.wait();
+            let _ = server.kill();
+            let _ = server.wait();
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // 等待端口和資源完全釋放
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        match result {
-            Ok(r) => {
-                bench::print_report(&r);
-                results.push(r);
+            match result {
+                Ok(r) => {
+                    bench::print_report(&r);
+                    rr_results.push(r);
+                }
+                Err(e) => eprintln!("  Benchmark failed for {}: {}", protocol, e),
             }
-            Err(e) => {
-                eprintln!("  Benchmark failed for {}: {}", protocol, e);
-            }
+            println!();
         }
+
+        bench::print_comparison(&rr_results);
         println!();
     }
 
-    // 輸出比較表格
-    bench::print_comparison(&results);
+    // ── Pub/Sub 模式 ──
+    if run_ps {
+        println!("══════════════════════════════════════════");
+        println!("  Pub/Sub Benchmark");
+        println!("══════════════════════════════════════════");
 
-    // 輸出 JSON
+        let total_messages = args.warmup + args.iterations;
+
+        for protocol in ALL_PROTOCOLS {
+            println!("────────────────────────────────────────");
+            println!("Protocol: {}", protocol);
+            println!("────────────────────────────────────────");
+
+            let mut server = match start_server(
+                protocol,
+                "pub-sub",
+                args.payload_size,
+                total_messages,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  Failed to start server: {}", e);
+                    continue;
+                }
+            };
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let result = async {
+                let subscriber = protocols::create_subscriber(protocol).await?;
+                let r = bench::run_pubsub_benchmark(
+                    &subscriber,
+                    &protocol.to_string(),
+                    args.payload_size,
+                    args.iterations,
+                    args.warmup,
+                )
+                .await;
+                drop(subscriber);
+                r
+            }
+            .await;
+
+            let _ = server.kill();
+            let _ = server.wait();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            match result {
+                Ok(r) => {
+                    bench::print_pubsub_report(&r);
+                    ps_results.push(r);
+                }
+                Err(e) => eprintln!("  Benchmark failed for {}: {}", protocol, e),
+            }
+            println!();
+        }
+
+        bench::print_pubsub_comparison(&ps_results);
+    }
+
+    // ── JSON 輸出 ──
     if let Some(path) = &args.json_output {
-        let json = serde_json::to_string_pretty(&results)?;
+        #[derive(serde::Serialize)]
+        struct AllResults {
+            request_reply: Vec<bench::BenchResult>,
+            pubsub: Vec<bench::PubSubResult>,
+        }
+        let all = AllResults {
+            request_reply: rr_results,
+            pubsub: ps_results,
+        };
+        let json = serde_json::to_string_pretty(&all)?;
         std::fs::write(path, &json)?;
         println!("\nResults written to {}", path);
     }
