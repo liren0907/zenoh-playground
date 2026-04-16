@@ -1,0 +1,41 @@
+# Benchmark configuration
+#
+# Copy to bench.yaml to use automatically, or pass --config <path> to bench-*.
+# All fields are optional — missing fields fall back to built-in defaults.
+#
+# Precedence: built-in defaults < bench.yaml < CLI flags
+#   --port-offset N       # shifts every port by N (escape hatch)
+#   --http-port / --grpc-port / --key-prefix   # per-field overrides
+
+http:
+  port: 8080
+
+grpc:
+  port: 50052
+
+zenoh:
+  # Prepended to echo / stream / stream/ready key expressions.
+  # Change this to isolate multiple benchmarks sharing the same Zenoh fabric.
+  key_prefix: "bench"
+
+  # Unix socket path (used by --protocol zenoh-unix).
+  socket_path: "/tmp/zenoh-bench.sock"
+
+  # TLS cert directory (used by zenoh-tls / zenoh-quic). Self-signed certs are
+  # generated on first run and reused thereafter.
+  cert_dir: "/tmp/zenoh-bench-certs"
+
+  ports:
+    shm: 7447
+    tcp: 7448
+    tls: 7449
+    quic: 7450
+    ws: 7451
+
+defaults:
+  # Default values when not specified on the CLI.
+  # (Currently only consumed by bench-all's payload sweep default.)
+  iterations: 1000
+  warmup: 50
+  window_secs: 5
+  payload_sizes: [64, 1024, 4096, 65536, 1048576]

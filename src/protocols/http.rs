@@ -1,25 +1,26 @@
 // HTTP 基準測試傳輸層
 // 使用 axum 作為伺服器，reqwest 作為客戶端
 
+use crate::config::BenchConfig;
 use anyhow::Result;
 use axum::extract::Query;
 use axum::response::IntoResponse;
 use axum::{Router, routing::{get, post}};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const HTTP_ADDR: &str = "0.0.0.0:8080";
-const HTTP_URL: &str = "http://127.0.0.1:8080/echo";
-const HTTP_STREAM_URL: &str = "http://127.0.0.1:8080/stream";
-
 /// HTTP 基準測試伺服器
-pub struct HttpServer;
+pub struct HttpServer {
+    pub cfg: Arc<BenchConfig>,
+}
 
 impl HttpServer {
     pub async fn serve(&self) -> Result<()> {
         let app = Router::new().route("/echo", post(echo_handler));
-        let listener = TcpListener::bind(HTTP_ADDR).await?;
+        let addr = self.cfg.http_addr();
+        let listener = TcpListener::bind(&addr).await?;
 
-        println!("[Server] Listening on http://{}/echo", HTTP_ADDR);
+        println!("[Server] Listening on http://{}/echo", addr);
         println!("Press Ctrl+C to stop...");
 
         axum::serve(listener, app).await?;
@@ -35,20 +36,22 @@ async fn echo_handler(body: axum::body::Bytes) -> axum::body::Bytes {
 /// HTTP 基準測試客戶端
 pub struct HttpClient {
     client: reqwest::Client,
+    echo_url: String,
 }
 
 impl HttpClient {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(cfg: &BenchConfig) -> Result<Self> {
         let client = reqwest::Client::new();
+        let echo_url = cfg.http_echo_url();
 
         // 等待伺服器就緒
         println!("[Client] Waiting for server...");
         let mut delay = tokio::time::Duration::from_millis(100);
         for attempt in 1..=20 {
-            match client.post(HTTP_URL).body(vec![0u8; 1]).send().await {
+            match client.post(&echo_url).body(vec![0u8; 1]).send().await {
                 Ok(_) => {
                     println!("[Client] Server is ready (attempt {})", attempt);
-                    return Ok(Self { client });
+                    return Ok(Self { client, echo_url });
                 }
                 Err(_) => {
                     if attempt < 20 {
@@ -65,7 +68,7 @@ impl HttpClient {
     pub async fn send(&self, payload: &[u8]) -> Result<Vec<u8>> {
         let resp = self
             .client
-            .post(HTTP_URL)
+            .post(&self.echo_url)
             .body(payload.to_vec())
             .send()
             .await?;
@@ -82,16 +85,19 @@ struct StreamParams {
 }
 
 /// HTTP 串流伺服器（同時提供 echo 和 stream 端點）
-pub struct HttpStreamServer;
+pub struct HttpStreamServer {
+    pub cfg: Arc<BenchConfig>,
+}
 
 impl HttpStreamServer {
     pub async fn start(&self, _payload_size: usize, _count: usize) -> Result<()> {
         let app = Router::new()
             .route("/echo", post(echo_handler))
             .route("/stream", get(stream_handler));
-        let listener = TcpListener::bind(HTTP_ADDR).await?;
+        let addr = self.cfg.http_addr();
+        let listener = TcpListener::bind(&addr).await?;
 
-        println!("[Server] Listening on http://{}/stream", HTTP_ADDR);
+        println!("[Server] Listening on http://{}/stream", addr);
         println!("Press Ctrl+C to stop...");
 
         axum::serve(listener, app).await?;
@@ -122,18 +128,23 @@ async fn stream_handler(Query(params): Query<StreamParams>) -> impl IntoResponse
 }
 
 /// HTTP 串流客戶端
-pub struct HttpStreamClient;
+pub struct HttpStreamClient {
+    stream_url: String,
+}
 
 impl HttpStreamClient {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(cfg: &BenchConfig) -> Result<Self> {
         let client = reqwest::Client::new();
+        let echo_url = cfg.http_echo_url();
+        let stream_url = cfg.http_stream_url();
+
         println!("[Client] Waiting for server...");
         let mut delay = tokio::time::Duration::from_millis(100);
         for attempt in 1..=20 {
-            match client.post(HTTP_URL).body(vec![0u8; 1]).send().await {
+            match client.post(&echo_url).body(vec![0u8; 1]).send().await {
                 Ok(_) => {
                     println!("[Client] Server is ready (attempt {})", attempt);
-                    return Ok(Self);
+                    return Ok(Self { stream_url });
                 }
                 Err(_) => {
                     if attempt < 20 {
@@ -148,7 +159,7 @@ impl HttpStreamClient {
 
     pub async fn subscribe(&self, count: usize, payload_size: usize, publishers: usize) -> Result<usize> {
         if publishers <= 1 {
-            Self::subscribe_single_stream(count, payload_size).await
+            Self::subscribe_single_stream(&self.stream_url, count, payload_size).await
         } else {
             // 多串流併發：每個 stream 接收 count/publishers 條訊息
             let base_count = count / publishers;
@@ -157,9 +168,10 @@ impl HttpStreamClient {
             let mut handles = Vec::with_capacity(publishers);
             for i in 0..publishers {
                 let stream_count = base_count + if i < remainder { 1 } else { 0 };
-                handles.push(tokio::spawn(
-                    Self::subscribe_single_stream(stream_count, payload_size),
-                ));
+                let url = self.stream_url.clone();
+                handles.push(tokio::spawn(async move {
+                    Self::subscribe_single_stream(&url, stream_count, payload_size).await
+                }));
             }
 
             let mut total = 0;
@@ -170,10 +182,10 @@ impl HttpStreamClient {
         }
     }
 
-    async fn subscribe_single_stream(count: usize, payload_size: usize) -> Result<usize> {
+    async fn subscribe_single_stream(stream_url: &str, count: usize, payload_size: usize) -> Result<usize> {
         use futures::StreamExt;
 
-        let url = format!("{}?payload_size={}&count={}", HTTP_STREAM_URL, payload_size, count);
+        let url = format!("{}?payload_size={}&count={}", stream_url, payload_size, count);
         let resp = reqwest::get(&url).await?;
         let mut stream = resp.bytes_stream();
 

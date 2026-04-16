@@ -5,7 +5,9 @@ pub mod grpc;
 pub mod http;
 pub mod zenoh_common;
 
+use crate::config::BenchConfig;
 use anyhow::Result;
+use std::sync::Arc;
 
 /// 基準測試模式
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -99,7 +101,7 @@ impl BenchServerImpl {
 }
 
 /// 根據協定建立伺服器
-pub async fn create_server(protocol: &Protocol) -> Result<BenchServerImpl> {
+pub async fn create_server(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<BenchServerImpl> {
     match protocol {
         Protocol::ZenohShm
         | Protocol::ZenohUnix
@@ -107,16 +109,16 @@ pub async fn create_server(protocol: &Protocol) -> Result<BenchServerImpl> {
         | Protocol::ZenohTls
         | Protocol::ZenohQuic
         | Protocol::ZenohWs => {
-            let server = zenoh_common::ZenohServer::new(protocol).await?;
+            let server = zenoh_common::ZenohServer::new(protocol, cfg).await?;
             Ok(BenchServerImpl::Zenoh(server))
         }
-        Protocol::Http => Ok(BenchServerImpl::Http(http::HttpServer)),
-        Protocol::Grpc => Ok(BenchServerImpl::Grpc(grpc::GrpcServer)),
+        Protocol::Http => Ok(BenchServerImpl::Http(http::HttpServer { cfg })),
+        Protocol::Grpc => Ok(BenchServerImpl::Grpc(grpc::GrpcServer { cfg })),
     }
 }
 
 /// 根據協定建立客戶端
-pub async fn create_client(protocol: &Protocol) -> Result<BenchClient> {
+pub async fn create_client(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<BenchClient> {
     match protocol {
         Protocol::ZenohShm
         | Protocol::ZenohUnix
@@ -124,15 +126,15 @@ pub async fn create_client(protocol: &Protocol) -> Result<BenchClient> {
         | Protocol::ZenohTls
         | Protocol::ZenohQuic
         | Protocol::ZenohWs => {
-            let client = zenoh_common::ZenohClient::new(protocol).await?;
+            let client = zenoh_common::ZenohClient::new(protocol, cfg).await?;
             Ok(BenchClient::Zenoh(client))
         }
         Protocol::Http => {
-            let client = http::HttpClient::new().await?;
+            let client = http::HttpClient::new(&cfg).await?;
             Ok(BenchClient::Http(client))
         }
         Protocol::Grpc => {
-            let client = grpc::GrpcClient::new().await?;
+            let client = grpc::GrpcClient::new(&cfg).await?;
             Ok(BenchClient::Grpc(client))
         }
     }
@@ -191,7 +193,7 @@ impl BenchSubscriber {
 }
 
 /// 根據協定建立發佈者
-pub async fn create_publisher(protocol: &Protocol) -> Result<BenchPublisher> {
+pub async fn create_publisher(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<BenchPublisher> {
     match protocol {
         Protocol::ZenohShm
         | Protocol::ZenohUnix
@@ -199,16 +201,16 @@ pub async fn create_publisher(protocol: &Protocol) -> Result<BenchPublisher> {
         | Protocol::ZenohTls
         | Protocol::ZenohQuic
         | Protocol::ZenohWs => {
-            let publisher = zenoh_common::ZenohBenchPublisher::new(protocol).await?;
+            let publisher = zenoh_common::ZenohBenchPublisher::new(protocol, cfg).await?;
             Ok(BenchPublisher::Zenoh(publisher))
         }
-        Protocol::Http => Ok(BenchPublisher::Http(http::HttpStreamServer)),
-        Protocol::Grpc => Ok(BenchPublisher::Grpc(grpc::GrpcStreamServer)),
+        Protocol::Http => Ok(BenchPublisher::Http(http::HttpStreamServer { cfg })),
+        Protocol::Grpc => Ok(BenchPublisher::Grpc(grpc::GrpcStreamServer { cfg })),
     }
 }
 
 /// 根據協定建立訂閱者
-pub async fn create_subscriber(protocol: &Protocol) -> Result<BenchSubscriber> {
+pub async fn create_subscriber(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<BenchSubscriber> {
     match protocol {
         Protocol::ZenohShm
         | Protocol::ZenohUnix
@@ -216,15 +218,15 @@ pub async fn create_subscriber(protocol: &Protocol) -> Result<BenchSubscriber> {
         | Protocol::ZenohTls
         | Protocol::ZenohQuic
         | Protocol::ZenohWs => {
-            let subscriber = zenoh_common::ZenohBenchSubscriber::new(protocol).await?;
+            let subscriber = zenoh_common::ZenohBenchSubscriber::new(protocol, cfg).await?;
             Ok(BenchSubscriber::Zenoh(subscriber))
         }
         Protocol::Http => {
-            let subscriber = http::HttpStreamClient::new().await?;
+            let subscriber = http::HttpStreamClient::new(&cfg).await?;
             Ok(BenchSubscriber::Http(subscriber))
         }
         Protocol::Grpc => {
-            let subscriber = grpc::GrpcStreamClient::new().await?;
+            let subscriber = grpc::GrpcStreamClient::new(&cfg).await?;
             Ok(BenchSubscriber::Grpc(subscriber))
         }
     }

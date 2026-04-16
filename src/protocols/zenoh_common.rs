@@ -13,37 +13,7 @@ use zenoh::shm::{BlockOn, GarbageCollect, PosixShmProviderBackend, ShmProviderBu
 use zenoh::{Config, Session, Wait};
 
 use super::Protocol;
-
-const BENCH_KEY_EXPR: &str = "bench/echo";
-const PUBSUB_KEY_EXPR: &str = "bench/stream";
-const PUBSUB_READY_KEY: &str = "bench/stream/ready";
-const CERT_DIR: &str = "/tmp/zenoh-bench-certs";
-
-/// 根據協定回傳伺服器端監聽的端點 URL
-fn server_endpoint(protocol: &Protocol) -> &'static str {
-    match protocol {
-        Protocol::ZenohShm => "tcp/0.0.0.0:7447",
-        Protocol::ZenohUnix => "unixsock-stream//tmp/zenoh-bench.sock",
-        Protocol::ZenohTcp => "tcp/0.0.0.0:7448",
-        Protocol::ZenohTls => "tls/0.0.0.0:7449",
-        Protocol::ZenohQuic => "quic/0.0.0.0:7450",
-        Protocol::ZenohWs => "ws/0.0.0.0:7451",
-        _ => unreachable!(),
-    }
-}
-
-/// 根據協定回傳客戶端連線的端點 URL
-fn client_endpoint(protocol: &Protocol) -> &'static str {
-    match protocol {
-        Protocol::ZenohShm => "tcp/127.0.0.1:7447",
-        Protocol::ZenohUnix => "unixsock-stream//tmp/zenoh-bench.sock",
-        Protocol::ZenohTcp => "tcp/127.0.0.1:7448",
-        Protocol::ZenohTls => "tls/127.0.0.1:7449",
-        Protocol::ZenohQuic => "quic/127.0.0.1:7450",
-        Protocol::ZenohWs => "ws/127.0.0.1:7451",
-        _ => unreachable!(),
-    }
-}
+use crate::config::BenchConfig;
 
 /// 是否需要啟用 SHM
 fn needs_shm(protocol: &Protocol) -> bool {
@@ -63,8 +33,8 @@ struct TlsCertPaths {
 }
 
 /// 產生自簽憑證供 TLS/QUIC 基準測試使用
-fn setup_tls_certs() -> Result<TlsCertPaths> {
-    let dir = PathBuf::from(CERT_DIR);
+fn setup_tls_certs(cfg: &BenchConfig) -> Result<TlsCertPaths> {
+    let dir = PathBuf::from(&cfg.zenoh.cert_dir);
     std::fs::create_dir_all(&dir)?;
 
     let paths = TlsCertPaths {
@@ -99,7 +69,7 @@ fn setup_tls_certs() -> Result<TlsCertPaths> {
     std::fs::write(&paths.server_cert, server_cert.pem())?;
     std::fs::write(&paths.server_key, server_key.serialize_pem())?;
 
-    println!("[TLS] Generated self-signed certificates in {}", CERT_DIR);
+    println!("[TLS] Generated self-signed certificates in {}", cfg.zenoh.cert_dir);
     Ok(paths)
 }
 
@@ -137,10 +107,10 @@ fn insert_json5(config: &mut Config, key: &str, value: &str) -> Result<()> {
 }
 
 /// 建立伺服器端 Zenoh 設定
-fn server_config(protocol: &Protocol) -> Result<Config> {
+fn server_config(protocol: &Protocol, cfg: &BenchConfig) -> Result<Config> {
     let mut config = Config::default();
 
-    let endpoint = server_endpoint(protocol);
+    let endpoint = cfg.zenoh_listen(protocol);
     insert_json5(&mut config, "listen/endpoints", &format!(r#"["{}"]"#, endpoint))?;
     insert_json5(&mut config, "scouting/multicast/enabled", "false")?;
 
@@ -149,7 +119,7 @@ fn server_config(protocol: &Protocol) -> Result<Config> {
     }
 
     if needs_tls(protocol) {
-        let certs = setup_tls_certs()?;
+        let certs = setup_tls_certs(cfg)?;
         apply_tls_server_config(&mut config, &certs)?;
     }
 
@@ -157,10 +127,10 @@ fn server_config(protocol: &Protocol) -> Result<Config> {
 }
 
 /// 建立客戶端 Zenoh 設定
-fn client_config(protocol: &Protocol) -> Result<Config> {
+fn client_config(protocol: &Protocol, cfg: &BenchConfig) -> Result<Config> {
     let mut config = Config::default();
 
-    let endpoint = client_endpoint(protocol);
+    let endpoint = cfg.zenoh_connect(protocol);
     insert_json5(&mut config, "connect/endpoints", &format!(r#"["{}"]"#, endpoint))?;
     insert_json5(&mut config, "scouting/multicast/enabled", "false")?;
 
@@ -169,7 +139,7 @@ fn client_config(protocol: &Protocol) -> Result<Config> {
     }
 
     if needs_tls(protocol) {
-        let certs = setup_tls_certs()?;
+        let certs = setup_tls_certs(cfg)?;
         apply_tls_client_config(&mut config, &certs)?;
     }
 
@@ -180,31 +150,33 @@ fn client_config(protocol: &Protocol) -> Result<Config> {
 /// 宣告 queryable 並回傳收到的原始 bytes
 pub struct ZenohServer {
     session: Session,
+    cfg: Arc<BenchConfig>,
 }
 
 impl ZenohServer {
-    pub async fn new(protocol: &Protocol) -> Result<Self> {
+    pub async fn new(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<Self> {
         // Unix socket 清理殘留的 socket 檔案
         if matches!(protocol, Protocol::ZenohUnix) {
-            let _ = std::fs::remove_file("/tmp/zenoh-bench.sock");
+            let _ = std::fs::remove_file(&cfg.zenoh.socket_path);
         }
 
-        let config = server_config(protocol)?;
+        let config = server_config(protocol, &cfg)?;
         let session = zenoh::open(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh server session: {}", e))?;
 
-        Ok(Self { session })
+        Ok(Self { session, cfg })
     }
 
     pub async fn serve(&self) -> Result<()> {
+        let echo_key = self.cfg.zenoh_echo_key();
         let queryable = self
             .session
-            .declare_queryable(BENCH_KEY_EXPR)
+            .declare_queryable(&echo_key)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare queryable: {}", e))?;
 
-        println!("[Server] Listening on '{}'", BENCH_KEY_EXPR);
+        println!("[Server] Listening on '{}'", echo_key);
         println!("Press Ctrl+C to stop...");
 
         // 持續監聽並回傳原始 bytes
@@ -226,30 +198,31 @@ impl ZenohServer {
 /// Zenoh 基準測試客戶端
 pub struct ZenohClient {
     session: Session,
+    cfg: Arc<BenchConfig>,
 }
 
 impl ZenohClient {
-    pub async fn new(protocol: &Protocol) -> Result<Self> {
-        let config = client_config(protocol)?;
+    pub async fn new(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<Self> {
+        let config = client_config(protocol, &cfg)?;
         let session = zenoh::open(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh client session: {}", e))?;
 
         // 等待連線建立，用 retry 確認伺服器就緒
-        Self::wait_for_server(&session).await?;
+        Self::wait_for_server(&session, &cfg.zenoh_echo_key()).await?;
 
-        Ok(Self { session })
+        Ok(Self { session, cfg })
     }
 
     /// 以指數退避重試確認伺服器已就緒
-    async fn wait_for_server(session: &Session) -> Result<()> {
+    async fn wait_for_server(session: &Session, echo_key: &str) -> Result<()> {
         println!("[Client] Waiting for server...");
         let mut delay = Duration::from_millis(100);
         let max_attempts = 20;
 
         for attempt in 1..=max_attempts {
             match session
-                .get(BENCH_KEY_EXPR)
+                .get(echo_key)
                 .payload(vec![0u8; 1])
                 .await
             {
@@ -274,7 +247,7 @@ impl ZenohClient {
     pub async fn send(&self, payload: &[u8]) -> Result<Vec<u8>> {
         let replies = self
             .session
-            .get(BENCH_KEY_EXPR)
+            .get(&self.cfg.zenoh_echo_key())
             .payload(payload.to_vec())
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
@@ -298,28 +271,31 @@ impl ZenohClient {
 pub struct ZenohBenchPublisher {
     session: Session,
     use_shm: bool,
+    cfg: Arc<BenchConfig>,
 }
 
 impl ZenohBenchPublisher {
-    pub async fn new(protocol: &Protocol) -> Result<Self> {
+    pub async fn new(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<Self> {
         if matches!(protocol, Protocol::ZenohUnix) {
-            let _ = std::fs::remove_file("/tmp/zenoh-bench.sock");
+            let _ = std::fs::remove_file(&cfg.zenoh.socket_path);
         }
 
         let use_shm = needs_shm(protocol);
-        let config = server_config(protocol)?;
+        let config = server_config(protocol, &cfg)?;
         let session = zenoh::open(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh publisher session: {}", e))?;
 
-        Ok(Self { session, use_shm })
+        Ok(Self { session, use_shm, cfg })
     }
 
     pub async fn start(&self, payload_size: usize, count: usize, publishers: usize) -> Result<()> {
         // 就緒信號：等待訂閱者查詢後才開始發佈
+        let ready_key = self.cfg.zenoh_ready_key();
+        let stream_key = self.cfg.zenoh_stream_key();
         let ready = self
             .session
-            .declare_queryable(PUBSUB_READY_KEY)
+            .declare_queryable(&ready_key)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare ready queryable: {}", e))?;
 
@@ -338,7 +314,7 @@ impl ZenohBenchPublisher {
             // 單一 publisher（原始路徑）
             let publisher = self
                 .session
-                .declare_publisher(PUBSUB_KEY_EXPR)
+                .declare_publisher(&stream_key)
                 .congestion_control(CongestionControl::Drop)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
@@ -350,7 +326,7 @@ impl ZenohBenchPublisher {
             }
         } else {
             // 多 publisher 併發
-            self.publish_concurrent(payload_size, count, publishers, &payload).await
+            self.publish_concurrent(payload_size, count, publishers, &payload, &stream_key).await
         }
     }
 
@@ -361,6 +337,7 @@ impl ZenohBenchPublisher {
         count: usize,
         publishers: usize,
         payload: &[u8],
+        stream_key: &str,
     ) -> Result<()> {
         let base_count = count / publishers;
         let remainder = count % publishers;
@@ -373,10 +350,11 @@ impl ZenohBenchPublisher {
             let task_count = base_count + if i < remainder { 1 } else { 0 };
             let session = self.session.clone();
             let task_payload = payload.clone();
+            let key = stream_key.to_string();
 
             let handle = tokio::spawn(async move {
                 let publisher = session
-                    .declare_publisher(PUBSUB_KEY_EXPR)
+                    .declare_publisher(key)
                     .congestion_control(CongestionControl::Drop)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to declare publisher {}: {}", i, e))?;
@@ -440,10 +418,13 @@ impl ZenohBenchPublisher {
 
     /// 時間限制模式：持續發送直到 duration 結束
     pub async fn start_timed(&self, payload_size: usize, duration_secs: u64, publishers: usize) -> Result<()> {
+        let ready_key = self.cfg.zenoh_ready_key();
+        let stream_key = self.cfg.zenoh_stream_key();
+
         // 就緒信號
         let ready = self
             .session
-            .declare_queryable(PUBSUB_READY_KEY)
+            .declare_queryable(&ready_key)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare ready queryable: {}", e))?;
 
@@ -466,10 +447,11 @@ impl ZenohBenchPublisher {
             let session = self.session.clone();
             let task_payload = payload.clone();
             let stop = stop.clone();
+            let key = stream_key.clone();
 
             let handle = tokio::spawn(async move {
                 let publisher = session
-                    .declare_publisher(PUBSUB_KEY_EXPR)
+                    .declare_publisher(key)
                     .congestion_control(CongestionControl::Drop)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to declare publisher {}: {}", i, e))?;
@@ -593,22 +575,26 @@ impl ZenohBenchPublisher {
 /// Zenoh Pub/Sub 訂閱者
 pub struct ZenohBenchSubscriber {
     session: Session,
+    cfg: Arc<BenchConfig>,
 }
 
 impl ZenohBenchSubscriber {
-    pub async fn new(protocol: &Protocol) -> Result<Self> {
-        let config = client_config(protocol)?;
+    pub async fn new(protocol: &Protocol, cfg: Arc<BenchConfig>) -> Result<Self> {
+        let config = client_config(protocol, &cfg)?;
         let session = zenoh::open(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh subscriber session: {}", e))?;
 
-        Ok(Self { session })
+        Ok(Self { session, cfg })
     }
 
     pub async fn subscribe(&self, count: usize) -> Result<usize> {
+        let stream_key = self.cfg.zenoh_stream_key();
+        let ready_key = self.cfg.zenoh_ready_key();
+
         let subscriber = self
             .session
-            .declare_subscriber(PUBSUB_KEY_EXPR)
+            .declare_subscriber(&stream_key)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare subscriber: {}", e))?;
 
@@ -616,7 +602,7 @@ impl ZenohBenchSubscriber {
         println!("[Subscriber] Signaling publisher to start...");
         let mut delay = Duration::from_millis(100);
         for attempt in 1..=20 {
-            match self.session.get(PUBSUB_READY_KEY).await {
+            match self.session.get(&ready_key).await {
                 Ok(replies) => {
                     if replies.recv_async().await.is_ok() {
                         println!("[Subscriber] Publisher is ready (attempt {})", attempt);

@@ -1,7 +1,9 @@
 // gRPC 基準測試傳輸層
 // 使用 tonic 作為伺服器和客戶端
 
+use crate::config::BenchConfig;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
@@ -14,9 +16,6 @@ use pb::echo_server::{Echo, EchoServer};
 use pb::bench_stream_client::BenchStreamClient;
 use pb::bench_stream_server::{BenchStream, BenchStreamServer};
 use pb::{EchoRequest, EchoResponse, StreamRequest, StreamResponse};
-
-const GRPC_ADDR: &str = "0.0.0.0:50052";
-const GRPC_URL: &str = "http://127.0.0.1:50052";
 
 /// gRPC Echo 服務實作
 #[derive(Default)]
@@ -69,19 +68,22 @@ impl BenchStream for StreamService {
 }
 
 /// gRPC 基準測試伺服器
-pub struct GrpcServer;
+pub struct GrpcServer {
+    pub cfg: Arc<BenchConfig>,
+}
 
 impl GrpcServer {
     pub async fn serve(&self) -> Result<()> {
-        let addr = GRPC_ADDR.parse()?;
+        let addr = self.cfg.grpc_addr();
+        let parsed = addr.parse()?;
 
-        println!("[Server] Listening on grpc://{}", GRPC_ADDR);
+        println!("[Server] Listening on grpc://{}", addr);
         println!("Press Ctrl+C to stop...");
 
         tonic::transport::Server::builder()
             .add_service(EchoServer::new(EchoService))
             .add_service(BenchStreamServer::new(StreamService))
-            .serve(addr)
+            .serve(parsed)
             .await?;
 
         Ok(())
@@ -94,12 +96,13 @@ pub struct GrpcClient {
 }
 
 impl GrpcClient {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(cfg: &BenchConfig) -> Result<Self> {
         println!("[Client] Waiting for server...");
         let mut delay = tokio::time::Duration::from_millis(100);
+        let url = cfg.grpc_url();
 
         for attempt in 1..=20 {
-            match EchoClient::connect(GRPC_URL).await {
+            match EchoClient::connect(url.clone()).await {
                 Ok(client) => {
                     println!("[Client] Server is ready (attempt {})", attempt);
                     return Ok(Self { client });
@@ -129,19 +132,22 @@ impl GrpcClient {
 // ── Pub/Sub 模式（server streaming） ──
 
 /// gRPC 串流伺服器（同時提供 Echo 和 BenchStream 服務）
-pub struct GrpcStreamServer;
+pub struct GrpcStreamServer {
+    pub cfg: Arc<BenchConfig>,
+}
 
 impl GrpcStreamServer {
     pub async fn start(&self, _payload_size: usize, _count: usize) -> Result<()> {
-        let addr = GRPC_ADDR.parse()?;
+        let addr = self.cfg.grpc_addr();
+        let parsed = addr.parse()?;
 
-        println!("[Server] Listening on grpc://{} (streaming)", GRPC_ADDR);
+        println!("[Server] Listening on grpc://{} (streaming)", addr);
         println!("Press Ctrl+C to stop...");
 
         tonic::transport::Server::builder()
             .add_service(EchoServer::new(EchoService))
             .add_service(BenchStreamServer::new(StreamService))
-            .serve(addr)
+            .serve(parsed)
             .await?;
 
         Ok(())
@@ -149,18 +155,21 @@ impl GrpcStreamServer {
 }
 
 /// gRPC 串流客戶端
-pub struct GrpcStreamClient;
+pub struct GrpcStreamClient {
+    url: String,
+}
 
 impl GrpcStreamClient {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(cfg: &BenchConfig) -> Result<Self> {
         println!("[Client] Waiting for server...");
         let mut delay = tokio::time::Duration::from_millis(100);
+        let url = cfg.grpc_url();
 
         for attempt in 1..=20 {
-            match BenchStreamClient::connect(GRPC_URL).await {
+            match BenchStreamClient::connect(url.clone()).await {
                 Ok(_) => {
                     println!("[Client] Server is ready (attempt {})", attempt);
-                    return Ok(Self);
+                    return Ok(Self { url });
                 }
                 Err(_) => {
                     if attempt < 20 {
@@ -176,7 +185,7 @@ impl GrpcStreamClient {
 
     pub async fn subscribe(&self, count: usize, payload_size: usize, publishers: usize) -> Result<usize> {
         if publishers <= 1 {
-            Self::subscribe_single_stream(count, payload_size).await
+            Self::subscribe_single_stream(&self.url, count, payload_size).await
         } else {
             let base_count = count / publishers;
             let remainder = count % publishers;
@@ -184,9 +193,10 @@ impl GrpcStreamClient {
             let mut handles = Vec::with_capacity(publishers);
             for i in 0..publishers {
                 let stream_count = base_count + if i < remainder { 1 } else { 0 };
-                handles.push(tokio::spawn(
-                    Self::subscribe_single_stream(stream_count, payload_size),
-                ));
+                let url = self.url.clone();
+                handles.push(tokio::spawn(async move {
+                    Self::subscribe_single_stream(&url, stream_count, payload_size).await
+                }));
             }
 
             let mut total = 0;
@@ -197,8 +207,8 @@ impl GrpcStreamClient {
         }
     }
 
-    async fn subscribe_single_stream(count: usize, payload_size: usize) -> Result<usize> {
-        let mut client = BenchStreamClient::connect(GRPC_URL).await?;
+    async fn subscribe_single_stream(url: &str, count: usize, payload_size: usize) -> Result<usize> {
+        let mut client = BenchStreamClient::connect(url.to_string()).await?;
 
         let request = StreamRequest {
             payload_size: payload_size as u32,

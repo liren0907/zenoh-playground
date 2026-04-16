@@ -3,8 +3,11 @@
 
 use anyhow::Result;
 use clap::Parser;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use zenoh_playground::bench;
+use zenoh_playground::config::{BenchConfig, CliOverrides};
 use zenoh_playground::protocols::{self, BenchMode, Protocol};
 
 #[derive(Parser)]
@@ -45,11 +48,41 @@ struct Args {
     /// Write JSON results to this file
     #[arg(long)]
     json_output: Option<String>,
+
+    /// Path to bench.yaml config file (default: ./bench.yaml if exists)
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Add N to every protocol port (escape-hatch for port conflicts)
+    #[arg(long)]
+    port_offset: Option<u16>,
+
+    /// Override HTTP port
+    #[arg(long)]
+    http_port: Option<u16>,
+
+    /// Override gRPC port
+    #[arg(long)]
+    grpc_port: Option<u16>,
+
+    /// Override Zenoh key prefix
+    #[arg(long)]
+    key_prefix: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    let mut cfg = BenchConfig::load(args.config.as_deref())?;
+    cfg.apply_cli(CliOverrides {
+        port_offset: args.port_offset,
+        http_port: args.http_port,
+        grpc_port: args.grpc_port,
+        key_prefix: args.key_prefix,
+    });
+    let cfg = Arc::new(cfg);
+
     println!(
         "Starting benchmark: protocol={}, mode={}, payload={}B",
         args.protocol, args.mode, args.payload_size
@@ -57,7 +90,7 @@ async fn main() -> Result<()> {
 
     match args.mode {
         BenchMode::RequestReply => {
-            let client = protocols::create_client(&args.protocol).await?;
+            let client = protocols::create_client(&args.protocol, cfg).await?;
             let result = bench::run_benchmark(
                 &client,
                 &args.protocol.to_string(),
@@ -76,7 +109,7 @@ async fn main() -> Result<()> {
             }
         }
         BenchMode::PubSub => {
-            let subscriber = protocols::create_subscriber(&args.protocol).await?;
+            let subscriber = protocols::create_subscriber(&args.protocol, cfg).await?;
 
             if let Some(duration) = args.duration {
                 // Sustained load 模式

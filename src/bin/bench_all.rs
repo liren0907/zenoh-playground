@@ -1,13 +1,16 @@
 // 全協定基準測試
 // 依序對所有協定執行 benchmark，支援多 payload 大小掃描
 
+use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
 use zenoh_playground::bench;
+use zenoh_playground::config::{BenchConfig, CliOverrides};
 use zenoh_playground::protocols::{self, ALL_PROTOCOLS, Protocol};
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -55,12 +58,58 @@ struct Args {
     /// Write JSON results to this file
     #[arg(long)]
     json_output: Option<String>,
+
+    /// Path to bench.yaml config file (default: ./bench.yaml if exists)
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Add N to every protocol port (escape-hatch for port conflicts)
+    #[arg(long)]
+    port_offset: Option<u16>,
+
+    /// Override HTTP port
+    #[arg(long)]
+    http_port: Option<u16>,
+
+    /// Override gRPC port
+    #[arg(long)]
+    grpc_port: Option<u16>,
+
+    /// Override Zenoh key prefix
+    #[arg(long)]
+    key_prefix: Option<String>,
 }
 
 fn server_binary_path() -> std::path::PathBuf {
     let mut path = std::env::current_exe().expect("Failed to get current exe path");
     path.set_file_name("bench-server");
     path
+}
+
+/// 組出要透傳給 child process 的設定 flag
+fn config_passthrough_args(args: &Args) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = &args.config {
+        out.push("--config".to_string());
+        out.push(p.to_string_lossy().to_string());
+    }
+    if let Some(o) = args.port_offset {
+        out.push("--port-offset".to_string());
+        out.push(o.to_string());
+    }
+    if let Some(p) = args.http_port {
+        out.push("--http-port".to_string());
+        out.push(p.to_string());
+    }
+    if let Some(p) = args.grpc_port {
+        out.push("--grpc-port".to_string());
+        out.push(p.to_string());
+    }
+    if let Some(k) = &args.key_prefix {
+        out.push("--key-prefix".to_string());
+        out.push(k.clone());
+    }
+    out
 }
 
 fn start_server(
@@ -70,6 +119,7 @@ fn start_server(
     count: usize,
     publishers: usize,
     duration: Option<u64>,
+    cfg_args: &[String],
 ) -> Result<Child> {
     let mut args = vec![
         "--protocol".to_string(),
@@ -89,6 +139,9 @@ fn start_server(
         args.push(d.to_string());
     }
 
+    // 透傳 config 相關的 flag
+    args.extend_from_slice(cfg_args);
+
     let child = Command::new(server_binary_path())
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -100,6 +153,19 @@ fn start_server(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // 載入設定 + 套用 CLI 覆寫（本 process 自己用）
+    let mut cfg = BenchConfig::load(args.config.as_deref())?;
+    cfg.apply_cli(CliOverrides {
+        port_offset: args.port_offset,
+        http_port: args.http_port,
+        grpc_port: args.grpc_port,
+        key_prefix: args.key_prefix.clone(),
+    });
+    let cfg = Arc::new(cfg);
+
+    // 準備要透傳給 child process 的 flag
+    let cfg_args = config_passthrough_args(&args);
 
     // 決定要測試的 payload 大小列表
     let payload_sizes: Vec<usize> = if let Some(sizes) = &args.payload_sizes {
@@ -146,7 +212,7 @@ async fn main() -> Result<()> {
                 println!("Protocol: {}", protocol);
                 println!("────────────────────────────────────────");
 
-                let mut server = match start_server(protocol, "request-reply", payload_size, 0, 1, None) {
+                let mut server = match start_server(protocol, "request-reply", payload_size, 0, 1, None, &cfg_args) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("  Failed to start server: {}", e);
@@ -157,7 +223,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
                 let result = async {
-                    let client = protocols::create_client(protocol).await?;
+                    let client = protocols::create_client(protocol, cfg.clone()).await?;
                     let r = bench::run_benchmark(
                         &client,
                         &protocol.to_string(),
@@ -211,6 +277,7 @@ async fn main() -> Result<()> {
                     total_messages,
                     args.publishers,
                     None,
+                    &cfg_args,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -222,7 +289,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
                 let result = async {
-                    let subscriber = protocols::create_subscriber(protocol).await?;
+                    let subscriber = protocols::create_subscriber(protocol, cfg.clone()).await?;
                     let r = bench::run_pubsub_benchmark(
                         &subscriber,
                         &protocol.to_string(),
@@ -284,6 +351,7 @@ async fn main() -> Result<()> {
                     0,
                     args.publishers,
                     Some(duration + 5), // 給 server 多 5 秒確保不會提前停止
+                    &cfg_args,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -295,7 +363,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
                 let result = async {
-                    let subscriber = protocols::create_subscriber(protocol).await?;
+                    let subscriber = protocols::create_subscriber(protocol, cfg.clone()).await?;
                     let r = bench::run_sustained_benchmark(
                         &subscriber,
                         &protocol.to_string(),
